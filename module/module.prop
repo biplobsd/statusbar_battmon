@@ -1,0 +1,8 @@
+id=statusbar_battmon
+name=HyperOS Status Bar Battery Monitor
+version=v1.0
+versionCode=1
+author=biplobsd
+description=Status bar battery monitor for Xiaomi HyperOS. Pure Zygisk module with KernelSU WebUI.
+updateJson=https://raw.githubusercontent.com/biplobsd/statusbar_battmon/main/update.json
+banner=https://raw.githubusercontent.com/biplobsd/statusbar_battmon/main/banner.webp

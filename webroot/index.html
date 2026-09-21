@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Battery Status Monitor</title>
+    <style>
+        :root {
+            --bg-color: #0d1117;
+            --card-bg: rgba(22, 27, 34, 0.85);
+            --card-border: rgba(255, 255, 255, 0.08);
+            --text-primary: #f0f6fc;
+            --text-secondary: #8b949e;
+            --accent-cyan: #00d2ff;
+            --accent-blue: #3a7bd5;
+            --accent-green: #2ea043;
+            --accent-orange: #ff7b00;
+            --accent-red: #da3633;
+            --glass-bg: rgba(255, 255, 255, 0.04);
+            --radius-lg: 18px;
+            --radius-md: 12px;
+            --radius-sm: 8px;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        body {
+            background: linear-gradient(135deg, #090d13 0%, #0d131d 50%, #080b10 100%);
+            color: var(--text-primary);
+            min-height: 100vh;
+            padding: 16px 14px 40px;
+            overflow-x: hidden;
+        }
+
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 20px;
+            padding: 4px 8px;
+        }
+
+        .header-title {
+            font-size: 20px;
+            font-weight: 700;
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .badge {
+            font-size: 11px;
+            padding: 3px 8px;
+            border-radius: 20px;
+            background: rgba(0, 210, 255, 0.15);
+            color: var(--accent-cyan);
+            border: 1px solid rgba(0, 210, 255, 0.3);
+            font-weight: 600;
+        }
+
+        /* Settings Card */
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius-lg);
+            padding: 16px;
+            margin-bottom: 14px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+            backdrop-filter: blur(10px);
+        }
+
+        .card-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            margin-bottom: 14px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .setting-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .setting-row:last-child {
+            border-bottom: none;
+            padding-bottom: 0;
+        }
+
+        .setting-row:first-child {
+            padding-top: 0;
+        }
+
+        /* Stacked Column Setting for long text / dropdowns */
+        .setting-col {
+            display: flex;
+            flex-direction: column;
+            padding: 12px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            gap: 8px;
+        }
+
+        .setting-col:last-child {
+            border-bottom: none;
+            padding-bottom: 0;
+        }
+
+        .setting-info {
+            flex: 1;
+        }
+
+        .setting-name {
+            font-size: 15px;
+            font-weight: 500;
+            color: var(--text-primary);
+        }
+
+        .setting-desc {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }
+
+        /* Switch */
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 48px;
+            height: 28px;
+            flex-shrink: 0;
+        }
+
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-color: #2d333b;
+            transition: .25s cubic-bezier(0.4, 0, 0.2, 1);
+            border-radius: 28px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 22px;
+            width: 22px;
+            left: 2px;
+            bottom: 2px;
+            background-color: #fff;
+            transition: .25s cubic-bezier(0.4, 0, 0.2, 1);
+            border-radius: 50%;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        }
+
+        input:checked + .slider {
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            border-color: rgba(0, 210, 255, 0.4);
+        }
+
+        input:checked + .slider:before {
+            transform: translateX(20px);
+        }
+
+        /* Select & Range - Full Width No Overflow */
+        select {
+            width: 100%;
+            background: #1c2128;
+            color: var(--text-primary);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            padding: 10px 12px;
+            border-radius: var(--radius-sm);
+            font-size: 13.5px;
+            outline: none;
+            cursor: pointer;
+            box-sizing: border-box;
+            white-space: normal;
+            text-overflow: ellipsis;
+        }
+
+        input[type="range"] {
+            -webkit-appearance: none;
+            width: 100%;
+            height: 6px;
+            border-radius: 6px;
+            background: #2d333b;
+            outline: none;
+            margin-top: 8px;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: var(--accent-cyan);
+            cursor: pointer;
+            box-shadow: 0 0 10px rgba(0, 210, 255, 0.6);
+        }
+
+        .slider-container {
+            width: 100%;
+            padding: 10px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .slider-container:last-child {
+            border-bottom: none;
+            padding-bottom: 0;
+        }
+
+        .slider-header {
+            display: flex;
+            justify-content: space-between;
+            font-size: 13.5px;
+            font-weight: 500;
+            color: var(--text-primary);
+        }
+
+        .slider-val {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--accent-cyan);
+        }
+
+        /* Buttons */
+        .btn-group {
+            display: flex;
+            gap: 10px;
+            margin-top: 16px;
+        }
+
+        .btn {
+            flex: 1;
+            padding: 14px;
+            border-radius: var(--radius-md);
+            border: none;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            color: #fff;
+            box-shadow: 0 4px 15px rgba(0, 210, 255, 0.3);
+        }
+
+        .btn-primary:active {
+            transform: scale(0.98);
+            box-shadow: 0 2px 8px rgba(0, 210, 255, 0.2);
+        }
+
+        .btn-secondary {
+            background: #1c2128;
+            color: #8b949e;
+            border: 1px solid var(--card-border);
+        }
+
+        .btn-secondary:active {
+            background: #252b35;
+        }
+
+        /* Toast */
+        #toast {
+            position: fixed;
+            bottom: 24px;
+            left: 50%;
+            transform: translateX(-50%) translateY(100px);
+            background: rgba(22, 27, 34, 0.95);
+            border: 1px solid var(--accent-cyan);
+            color: #f0f6fc;
+            padding: 10px 20px;
+            border-radius: 30px;
+            font-size: 13px;
+            font-weight: 500;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+            opacity: 0;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            z-index: 1000;
+            pointer-events: none;
+        }
+
+        #toast.show {
+            transform: translateX(-50%) translateY(0);
+            opacity: 1;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <div class="header-title">
+            <span>⚡ BattMon Status</span>
+            <span class="badge">Zygisk</span>
+        </div>
+        <div id="liveDot" style="width: 8px; height: 8px; border-radius: 50%; background: #2ea043; box-shadow: 0 0 8px #2ea043;"></div>
+    </div>
+
+    <!-- Display Settings -->
+    <div class="card">
+        <div class="card-title">Display Settings</div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-name">Enable Status Bar Monitor</div>
+                <div class="setting-desc">Inject battery monitor into status bar</div>
+            </div>
+            <label class="switch">
+                <input type="checkbox" id="cfgEnabled" checked>
+                <span class="slider"></span>
+            </label>
+        </div>
+
+        <!-- Stacked full width dropdown: No Overflow -->
+        <div class="setting-col">
+            <div class="setting-info">
+                <div class="setting-name">Content Mode</div>
+                <div class="setting-desc">Choose which metrics to display</div>
+            </div>
+            <select id="cfgContentMode">
+                <option value="1">Temperature & Power (46.7°C 8.19W)</option>
+                <option value="2">Power Only (8.19W)</option>
+                <option value="3">Temperature Only (46.7°C)</option>
+                <option value="4">Temperature & Current (46.7°C 1930mA)</option>
+                <option value="5">Current & Power (1930mA 8.19W)</option>
+            </select>
+        </div>
+
+        <!-- Stacked full width dropdown: No Overflow -->
+        <div class="setting-col">
+            <div class="setting-info">
+                <div class="setting-name">Layout Style</div>
+                <div class="setting-desc">Stacked dual rows (like screenshot) or single row</div>
+            </div>
+            <select id="cfgLayout">
+                <option value="dual_line">Dual Line (Stacked)</option>
+                <option value="single_line">Single Line (Inline)</option>
+            </select>
+        </div>
+
+        <div class="setting-row">
+            <div class="setting-info">
+                <div class="setting-name">Show Only While Charging</div>
+                <div class="setting-desc">Automatically hide when discharging on battery</div>
+            </div>
+            <label class="switch">
+                <input type="checkbox" id="cfgChargingOnly">
+                <span class="slider"></span>
+            </label>
+        </div>
+    </div>
+
+    <!-- Alignment & Font Tuning -->
+    <div class="card">
+        <div class="card-title">Alignment & Font Tuning</div>
+
+        <div class="slider-container">
+            <div class="slider-header">
+                <span>Top Alignment (Padding Top)</span>
+                <span id="padTopDisplay" class="slider-val">+1.5 dp</span>
+            </div>
+            <div class="setting-desc" style="margin-top:2px;">Adjust to align vertically with the clock</div>
+            <input type="range" id="cfgPadTop" min="-2.0" max="12.0" step="0.5" value="1.5">
+        </div>
+
+        <div class="slider-container">
+            <div class="slider-header">
+                <span>Left Spacing (Padding Left)</span>
+                <span id="padLeftDisplay" class="slider-val">0.0 dp</span>
+            </div>
+            <div class="setting-desc" style="margin-top:2px;">Horizontal space between clock and monitor</div>
+            <input type="range" id="cfgPadLeft" min="0.0" max="8.0" step="0.5" value="0.0">
+        </div>
+
+        <div class="slider-container">
+            <div class="slider-header">
+                <span>Font Size</span>
+                <span id="fontSizeDisplay" class="slider-val">6.5 sp</span>
+            </div>
+            <div class="setting-desc" style="margin-top:2px;">Matches clock font family automatically</div>
+            <input type="range" id="cfgFontSize" min="4.0" max="14.0" step="0.5" value="6.5">
+        </div>
+
+        <div class="setting-col" style="margin-top: 10px;">
+            <div class="setting-info">
+                <div class="setting-name">Refresh Interval</div>
+                <div class="setting-desc">Update speed (automatically paused when screen is off)</div>
+            </div>
+            <select id="cfgInterval">
+                <option value="500">500 ms (Fast)</option>
+                <option value="1000" selected>1000 ms (Balanced - Recommended)</option>
+                <option value="2000">2000 ms (Battery Saver)</option>
+            </select>
+        </div>
+    </div>
+
+    <!-- Action Buttons -->
+    <div class="btn-group">
+        <button id="btnSave" class="btn btn-primary">
+            <span>💾 Apply Settings</span>
+        </button>
+        <button id="btnRestart" class="btn btn-secondary">
+            <span>🔄 Soft Restart UI</span>
+        </button>
+    </div>
+
+    <div id="toast">Settings Saved</div>
+
+    <script>
+        const CONFIG_PATH = "/data/local/tmp/battmon/config.json";
+        let currentConfig = {
+            enabled: true,
+            layout_mode: "dual_line",
+            content_mode: 1,
+            refresh_ms: 1000,
+            temp_unit: "°C",
+            power_unit: "W",
+            font_size_sp: 6.5,
+            bold_font: false,
+            charging_only: false,
+            padding_top_dp: 1.5,
+            padding_left_dp: 0.0
+        };
+
+        // KSU exec helper
+        async function runRoot(cmd) {
+            if (typeof ksu !== 'undefined' && ksu.exec) {
+                return await ksu.exec(cmd);
+            }
+            return { errno: -1, stdout: "", stderr: "Not in KernelSU environment" };
+        }
+
+        function showToast(msg) {
+            const toast = document.getElementById("toast");
+            toast.textContent = msg;
+            toast.classList.add("show");
+            setTimeout(() => toast.classList.remove("show"), 2500);
+        }
+
+        // Load config from device
+        async function loadDeviceConfig() {
+            try {
+                const res = await runRoot(`cat ${CONFIG_PATH} 2>/dev/null`);
+                if (res.errno === 0 && res.stdout) {
+                    const parsed = JSON.parse(res.stdout);
+                    currentConfig = Object.assign(currentConfig, parsed);
+                }
+            } catch (e) {}
+
+            document.getElementById("cfgEnabled").checked = currentConfig.enabled !== false;
+            const layout = currentConfig.layout_mode || "dual_line";
+            document.getElementById("cfgLayout").value = layout;
+            document.getElementById("cfgContentMode").value = currentConfig.content_mode || 1;
+            document.getElementById("cfgInterval").value = currentConfig.refresh_ms || 1000;
+            document.getElementById("cfgChargingOnly").checked = !!currentConfig.charging_only;
+            
+            const isDual = layout === "dual_line";
+            const defTop = isDual ? 1.5 : 0.5;
+            const defFont = isDual ? 6.5 : 6.0;
+
+            const padTop = currentConfig.padding_top_dp !== undefined ? currentConfig.padding_top_dp : defTop;
+            document.getElementById("cfgPadTop").value = padTop;
+            document.getElementById("padTopDisplay").textContent = (padTop >= 0 ? "+" : "") + padTop + " dp";
+
+            const padLeft = currentConfig.padding_left_dp !== undefined ? currentConfig.padding_left_dp : 0.0;
+            document.getElementById("cfgPadLeft").value = padLeft;
+            document.getElementById("padLeftDisplay").textContent = padLeft + " dp";
+
+            const fSize = currentConfig.font_size_sp !== undefined ? currentConfig.font_size_sp : defFont;
+            document.getElementById("cfgFontSize").value = fSize;
+            document.getElementById("fontSizeDisplay").textContent = fSize + " sp";
+        }
+
+        // Save config
+        async function saveConfig() {
+            currentConfig.enabled = document.getElementById("cfgEnabled").checked;
+            currentConfig.layout_mode = document.getElementById("cfgLayout").value;
+            currentConfig.content_mode = parseInt(document.getElementById("cfgContentMode").value);
+            currentConfig.refresh_ms = parseInt(document.getElementById("cfgInterval").value);
+            currentConfig.charging_only = document.getElementById("cfgChargingOnly").checked;
+            currentConfig.font_size_sp = parseFloat(document.getElementById("cfgFontSize").value);
+            currentConfig.padding_top_dp = parseFloat(document.getElementById("cfgPadTop").value);
+            currentConfig.padding_left_dp = parseFloat(document.getElementById("cfgPadLeft").value);
+
+            const json = JSON.stringify(currentConfig, null, 2);
+            const cmd = `mkdir -p /data/local/tmp/battmon && echo '${json.replace(/'/g, "'\\''")}' > ${CONFIG_PATH} && chmod 644 ${CONFIG_PATH} && chcon u:object_r:system_file:s0 ${CONFIG_PATH}`;
+            const res = await runRoot(cmd);
+            if (res.errno === 0) {
+                showToast("✓ Settings Applied Live!");
+            } else {
+                showToast("Error saving config");
+            }
+        }
+
+        // Restart SystemUI
+        async function restartSystemUI() {
+            if (confirm("Soft restart SystemUI to reset status bar view attachments?")) {
+                showToast("Restarting SystemUI...");
+                await runRoot("pkill -f com.android.systemui");
+            }
+        }
+
+        document.getElementById("btnSave").addEventListener("click", saveConfig);
+        document.getElementById("btnRestart").addEventListener("click", restartSystemUI);
+
+        document.getElementById("cfgPadTop").addEventListener("input", (e) => {
+            const v = parseFloat(e.target.value);
+            document.getElementById("padTopDisplay").textContent = (v >= 0 ? "+" : "") + v + " dp";
+        });
+
+        document.getElementById("cfgPadLeft").addEventListener("input", (e) => {
+            const v = parseFloat(e.target.value);
+            document.getElementById("padLeftDisplay").textContent = v + " dp";
+        });
+
+        document.getElementById("cfgFontSize").addEventListener("input", (e) => {
+            document.getElementById("fontSizeDisplay").textContent = e.target.value + " sp";
+        });
+
+        document.getElementById("cfgLayout").addEventListener("change", (e) => {
+            const isDual = e.target.value === "dual_line";
+            const defTop = isDual ? 1.5 : 0.5;
+            const defLeft = 0.0;
+            const defFont = isDual ? 6.5 : 6.0;
+
+            document.getElementById("cfgPadTop").value = defTop;
+            document.getElementById("padTopDisplay").textContent = (defTop >= 0 ? "+" : "") + defTop + " dp";
+
+            document.getElementById("cfgPadLeft").value = defLeft;
+            document.getElementById("padLeftDisplay").textContent = defLeft + " dp";
+
+            document.getElementById("cfgFontSize").value = defFont;
+            document.getElementById("fontSizeDisplay").textContent = defFont + " sp";
+
+            saveConfig();
+        });
+
+        document.getElementById("cfgContentMode").addEventListener("change", saveConfig);
+        document.getElementById("cfgEnabled").addEventListener("change", saveConfig);
+
+        loadDeviceConfig();
+    </script>
+</body>
+</html>
