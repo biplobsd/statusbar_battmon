@@ -10,13 +10,13 @@ A Zygisk module for Xiaomi HyperOS that displays battery temperature and power n
 
 ## Download
 
-Download the latest `statusbar_battmon.zip` from the [Releases](../../releases) page.
+Download the latest `statusbar_battmon-*.zip` (e.g. `statusbar_battmon-v1.1.zip`) from the [Releases](../../releases) page.
 
 ## Installation
 
 1. Open your root manager (**KernelSU**, **APatch**, or **Magisk**).
 2. Go to the **Modules** tab.
-3. Select **Install from storage** and choose `statusbar_battmon.zip`.
+3. Select **Install from storage** and choose the downloaded `statusbar_battmon-*.zip`.
 4. Once installation completes, **reboot your device**.
 
 ## Configuration

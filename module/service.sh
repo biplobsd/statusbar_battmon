@@ -11,4 +11,5 @@ fi
 
 if [ -f /data/local/tmp/battmon/config.json ]; then
     chmod 644 /data/local/tmp/battmon/config.json
+    chcon u:object_r:system_file:s0 /data/local/tmp/battmon/config.json
 fi

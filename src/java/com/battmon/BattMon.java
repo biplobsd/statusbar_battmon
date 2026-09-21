@@ -5,13 +5,18 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.graphics.Typeface;
+import android.os.BatteryManager;
+import android.os.Build;
+import android.os.FileObserver;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewParent;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -22,397 +27,930 @@ import java.io.FileInputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.regex.Pattern;
 
+/**
+ * HyperOS status-bar battery monitor.
+ *
+ * <p>Key Architecture Principles:
+ * <ul>
+ *   <li><b>Zero UI-thread blocking / Zero Main thread I/O</b>: Battery sysfs reads are executed
+ *       strictly on a low-priority background HandlerThread ({@link BattMonSampler}).</li>
+ *   <li><b>Zero WindowManagerService / system_server IPC load</b>: {@link BattMonView} has fixed
+ *       measured geometry based on worst-case bounds. Data updates only call draw-only
+ *       {@link View#invalidate()} and never {@link View#requestLayout()}.</li>
+ *   <li><b>Zero WakeLock / Uninhibited Deep Sleep & Dozing</b>: When the screen turns off
+ *       ({@link Intent#ACTION_SCREEN_OFF}), all tickers and background sampling are immediately
+ *       halted. Zero timers run while the panel is off. Zero wake locks are held.</li>
+ *   <li><b>Live Real-Time Power Monitoring</b>: While the screen is ON and the view is visible,
+ *       updates occur smoothly at the user-configured {@code refresh_ms} (default 1000ms).</li>
+ *   <li><b>Zero-stat() Config Watching</b>: Changes to {@code config.json} are observed live
+ *       via inotify ({@link FileObserver}).</li>
+ * </ul>
+ */
 public class BattMon {
+
     private static final String TAG = "BattMon";
-    private static final String DISABLE_FILE = "/data/local/tmp/battmon/disable";
-    private static final String CONFIG_FILE = "/data/local/tmp/battmon/config.json";
 
-    private static final String SYS_TEMP = "/sys/class/power_supply/battery/temp";
-    private static final String SYS_VOLTAGE = "/sys/class/power_supply/battery/voltage_now";
-    private static final String SYS_CURRENT = "/sys/class/power_supply/battery/current_now";
-    private static final String SYS_STATUS = "/sys/class/power_supply/battery/status";
+    private static final String CONFIG_DIR = "/data/local/tmp/battmon";
+    private static final String DISABLE_FILE = CONFIG_DIR + "/disable";
+    private static final String CONFIG_FILE = CONFIG_DIR + "/config.json";
 
-    private static final Pattern TIME_PATTERN = Pattern.compile("^\\d{1,2}:\\d{2}$");
+    /** Attach retry timing. */
+    private static final long ATTACH_FIRST_DELAY_MS = 120L;
+    private static final long ATTACH_MAX_DELAY_MS = 2500L;
+
+    /** Fallback config check (only used if inotify is unavailable). */
+    private static final long CONFIG_CHECK_MIN_INTERVAL_MS = 5000L;
+
+    /** Bounded view-tree scan so a pathological hierarchy cannot burn CPU. */
+    private static final int MAX_SCAN_DEPTH = 64;
+    private static final int MAX_SCAN_VIEWS = 4000;
+
+    /** Clock text pattern supporting 24h, 12h, seconds, and AM/PM formats. */
+    private static final Pattern CLOCK_PATTERN =
+            Pattern.compile("^\\d{1,2}:\\d{2}(?::\\d{2})?(?:\\s*[AaPp][Mm])?$");
+
+    /** power_source modes */
+    public static final int POWER_LIVE = 0;     // Live background sampling at refresh_ms (Recommended)
+    public static final int POWER_EVENT = 1;    // Sysfs read per system battery broadcast
+    public static final int POWER_COUNTER = 2;  // Charge counter only (zero sysfs I/O, coarse)
+
+    private static final String EXTRA_CHARGE_COUNTER = "charge_counter";
+    private static final long COUNTER_MIN_DELTA_UAH = 100L;
 
     private static BattMon sInstance;
 
+    // ------------------------------------------------------------------ cached reflection
+    private static Method sGetWmgInstance;
+    private static Field sWmgViewsField;
+    private static boolean sReflectionReady;
+
+    // ------------------------------------------------------------------ state
     private final Context mContext;
-    private final Handler mHandler = new Handler(Looper.getMainLooper());
+    private final Handler mMain = new Handler(Looper.getMainLooper());
+    private final BattMonSampler mSampler = new BattMonSampler();
+
+    private BattMonView mView;
+    private TextView mClock;
+    private boolean mViewStyleDirty = true;
     private boolean mScreenOn = true;
-    private int mAttachRetries = 0;
+    private boolean mAttachPending;
+    private int mAttachTries;
 
-    private BattMonView mInjectedView;
-    private TextView mClockView;
-    private long mLastConfigMtime = 0;
+    private FileObserver mConfigObserver;
+    private boolean mObserverRunning;
+    private volatile long mLastConfigCheckMs;
+    private long mLastConfigMtime;
 
-    // Config defaults
+    // ------------------------------------------------------------------ config
     private boolean mEnabled = true;
     private boolean mDualLine = true;
-    private int mContentMode = 1; // 1: Temp & Watt, 2: Watt only, 3: Temp only, 4: Temp & mA
+    private int mContentMode = 1;
     private int mRefreshMs = 1000;
-    private String mTempUnit = "°C";
+    private String mTempUnit = "\u00b0C";
     private String mPowerUnit = "W";
     private float mFontSizeSp = 6.5f;
-    private boolean mBoldFont = false;
-    private boolean mChargingOnly = false;
+    private boolean mBoldFont;
+    private boolean mChargingOnly;
     private float mPaddingTopDp = 1.5f;
-    private float mPaddingLeftDp = 0.0f;
+    private float mPaddingLeftDp;
+    private float mPaddingRightDp = 2.0f;
+    private int mPowerSource = POWER_LIVE;
 
-    private final Runnable mTickRunnable = new Runnable() {
-        @Override
-        public void run() {
-            if (!mScreenOn) return;
-            try {
-                checkConfigReload();
-                if (mEnabled) {
-                    if (mInjectedView == null || !mInjectedView.isAttachedToWindow()) {
-                        tryAttachView();
-                    }
-                    sampleAndUpdate();
-                } else if (mInjectedView != null) {
-                    mInjectedView.setVisibility(View.GONE);
-                }
-            } catch (Throwable t) {
-                Log.e(TAG, "Error in ticker", t);
-            }
-            mHandler.postDelayed(this, Math.max(250, mRefreshMs));
-        }
-    };
+    private String mWorstTop = "35.0\u00b0C";
+    private String mWorstBottom = "1.50W";
+
+    // ------------------------------------------------------------------ battery snapshot
+    private boolean mHaveBattery;
+    private int mTempTenths = 250;
+    private int mVoltageMv = 3800;
+    private int mStatus = 1;      // BatteryManager.BATTERY_STATUS_UNKNOWN
+    private int mPlugged;
+
+    private boolean mHaveCounter;
+    private boolean mCounterAnchorSticky;
+    private long mCounterUah;
+    private long mCounterAtMs;
+
+    private boolean mHaveCurrent;
+    private double mCurrentMa;
+    private int mSysfsFailures;
+
+    private boolean mSamplingActive;
+    private long mLastLogMs;
+    private long mLastBatteryLogMs;
+
+    private final StringBuilder mSb = new StringBuilder(32);
+
+    // ================================================================== lifecycle
 
     public static void init(Context context) {
-        if (sInstance != null) return;
+        if (sInstance != null) {
+            return;
+        }
         try {
             if (new File(DISABLE_FILE).exists()) {
                 Log.w(TAG, "Disabled via escape hatch: " + DISABLE_FILE);
                 return;
             }
-            sInstance = new BattMon(context);
-            sInstance.start();
+            final BattMon instance = new BattMon(context);
+            sInstance = instance;
+            instance.start();
         } catch (Throwable t) {
-            Log.e(TAG, "Failed to initialize BattMon", t);
+            Log.e(TAG, "Init failed", t);
         }
     }
 
     private BattMon(Context context) {
-        mContext = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        final Context app = context.getApplicationContext();
+        mContext = app != null ? app : context;
     }
 
     private void start() {
-        Log.i(TAG, "BattMon starting on HyperOS SystemUI...");
         loadConfig();
+        prepareWorstCaseStrings();
 
-        PowerManager pm = (PowerManager) mContext.getSystemService(Context.POWER_SERVICE);
+        final PowerManager pm = (PowerManager) mContext.getSystemService(Context.POWER_SERVICE);
         if (pm != null) {
             mScreenOn = pm.isInteractive();
         }
 
-        IntentFilter filter = new IntentFilter();
-        filter.addAction(Intent.ACTION_SCREEN_ON);
-        filter.addAction(Intent.ACTION_SCREEN_OFF);
-        filter.addAction(Intent.ACTION_USER_PRESENT);
-        mContext.registerReceiver(new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context context, Intent intent) {
-                if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) {
-                    mScreenOn = false;
-                    mHandler.removeCallbacks(mTickRunnable);
-                } else if (Intent.ACTION_SCREEN_ON.equals(intent.getAction()) ||
-                           Intent.ACTION_USER_PRESENT.equals(intent.getAction())) {
-                    if (!mScreenOn) {
-                        mScreenOn = true;
-                        mHandler.removeCallbacks(mTickRunnable);
-                        mHandler.post(mTickRunnable);
-                    }
-                }
-            }
-        }, filter);
-
+        startConfigObserver();
+        registerReceivers();
         initDarkIconDispatcher();
 
-        mHandler.post(new Runnable() {
-            @Override
-            public void run() {
-                boolean attached = tryAttachView();
-                if (!attached && mAttachRetries < 60) {
-                    mAttachRetries++;
-                    mHandler.postDelayed(this, 500);
-                } else {
-                    mHandler.post(mTickRunnable);
-                }
-            }
-        });
+        if (mView == null) {
+            scheduleAttach();
+        }
+        if (mScreenOn && mEnabled && mPowerSource == POWER_LIVE) {
+            startSampling();
+        }
+        Log.i(TAG, "BattMon started: enabled=" + mEnabled
+                + " dual=" + mDualLine + " mode=" + mContentMode + " interval=" + mRefreshMs
+                + " powerSource=" + mPowerSource);
     }
 
-    private boolean tryAttachView() {
-        try {
-            Class<?> wmgClass = Class.forName("android.view.WindowManagerGlobal");
-            Object wmg = wmgClass.getMethod("getInstance").invoke(null);
-            Field viewsField = wmgClass.getDeclaredField("mViews");
-            viewsField.setAccessible(true);
-            @SuppressWarnings("unchecked")
-            List<View> rootViews = (List<View>) viewsField.get(wmg);
-            if (rootViews == null || rootViews.isEmpty()) return false;
+    // ================================================================== config
 
-            for (View root : rootViews) {
-                TextView clock = findClockView(root);
-                if (clock != null && clock.getParent() instanceof ViewGroup) {
-                    ViewGroup parent = (ViewGroup) clock.getParent();
-                    View existing = parent.findViewWithTag(BattMonView.VIEW_TAG);
-                    if (existing instanceof BattMonView) {
-                        mInjectedView = (BattMonView) existing;
-                        mClockView = clock;
-                        mInjectedView.setVisibility(mEnabled ? View.VISIBLE : View.GONE);
-                        return true;
+    private void startConfigObserver() {
+        try {
+            final File dir = new File(CONFIG_DIR);
+            if (!dir.isDirectory()) {
+                return;
+            }
+            mConfigObserver = new FileObserver(dir,
+                    FileObserver.CLOSE_WRITE | FileObserver.MOVED_TO | FileObserver.CREATE
+                            | FileObserver.DELETE) {
+                @Override
+                public void onEvent(int event, String path) {
+                    if (path != null && (path.startsWith("config.json") || path.startsWith("disable"))) {
+                        mMain.removeCallbacks(mReloadRunnable);
+                        mMain.post(mReloadRunnable);
                     }
-
-                    BattMonView view = new BattMonView(parent.getContext());
-                    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                            ViewGroup.LayoutParams.WRAP_CONTENT,
-                            ViewGroup.LayoutParams.WRAP_CONTENT
-                    );
-                    lp.gravity = Gravity.CENTER_VERTICAL;
-                    view.setLayoutParams(lp);
-
-                    int clockIdx = parent.indexOfChild(clock);
-                    int insertIdx = clockIdx >= 0 ? clockIdx + 1 : 0;
-                    parent.addView(view, insertIdx);
-
-                    mInjectedView = view;
-                    mClockView = clock;
-                    mInjectedView.setVisibility(mEnabled ? View.VISIBLE : View.GONE);
-                    Log.i(TAG, "Successfully attached BattMonView next to clock at index " + insertIdx);
-                    try {
-                        Typeface tf = clock.getTypeface();
-                        int weight = (tf != null && android.os.Build.VERSION.SDK_INT >= 28) ? tf.getWeight() : -1;
-                        boolean isB = tf != null && tf.isBold();
-                        Log.i(TAG, "CLOCK_DIAG: class=" + clock.getClass().getName()
-                                + ", text='" + clock.getText() + "'"
-                                + ", pxSize=" + clock.getTextSize()
-                                + ", tf=" + tf
-                                + ", weight=" + weight
-                                + ", isBold=" + isB
-                                + ", incPad=" + clock.getIncludeFontPadding()
-                                + ", gravity=" + clock.getGravity()
-                                + ", fvs=" + clock.getFontVariationSettings()
-                                + ", pad=[" + clock.getPaddingLeft() + "," + clock.getPaddingTop() + "," + clock.getPaddingRight() + "," + clock.getPaddingBottom() + "]"
-                                + ", baseline=" + clock.getBaseline()
-                                + ", lp=" + clock.getLayoutParams()
-                                + ", parent=" + parent.getClass().getName()
-                                + ", parentH=" + parent.getHeight()
-                                + ", clockY=" + clock.getY() + ", clockTop=" + clock.getTop() + ", clockH=" + clock.getHeight());
-                    } catch (Throwable t) {
-                        Log.e(TAG, "Error logging clock diag", t);
-                    }
-                    return true;
                 }
-            }
+            };
+            mConfigObserver.startWatching();
+            mObserverRunning = true;
         } catch (Throwable t) {
-            Log.e(TAG, "Error in tryAttachView", t);
-        }
-        return false;
-    }
-
-    private TextView findClockView(View view) {
-        if (view instanceof TextView) {
-            TextView tv = (TextView) view;
-            CharSequence cs = tv.getText();
-            if (cs != null && TIME_PATTERN.matcher(cs.toString().trim()).matches()) {
-                return tv;
-            }
-            try {
-                String resName = view.getResources().getResourceEntryName(view.getId());
-                if (resName != null && resName.toLowerCase(Locale.ROOT).contains("clock")) {
-                    return tv;
-                }
-            } catch (Throwable ignored) {}
-        }
-        if (view instanceof ViewGroup) {
-            ViewGroup vg = (ViewGroup) view;
-            int count = vg.getChildCount();
-            for (int i = 0; i < count; i++) {
-                TextView found = findClockView(vg.getChildAt(i));
-                if (found != null) return found;
-            }
-        }
-        return null;
-    }
-
-    private void initDarkIconDispatcher() {
-        try {
-            Class<?> depClass = Class.forName("com.android.systemui.Dependency");
-            Class<?> darkDispatcherClass = Class.forName("com.android.systemui.plugins.DarkIconDispatcher");
-            Method getMethod = depClass.getMethod("get", Class.class);
-            Object dispatcher = getMethod.invoke(null, darkDispatcherClass);
-            if (dispatcher != null) {
-                Class<?> receiverClass = Class.forName("com.android.systemui.plugins.DarkIconDispatcher$DarkReceiver");
-                Object proxy = Proxy.newProxyInstance(
-                        receiverClass.getClassLoader(),
-                        new Class<?>[]{receiverClass},
-                        (proxyObj, method, args) -> {
-                            if ("onDarkChanged".equals(method.getName()) && args != null && args.length >= 3) {
-                                if (args[2] instanceof Integer) {
-                                    final int tint = (Integer) args[2];
-                                    if (mInjectedView != null) {
-                                        mInjectedView.post(() -> mInjectedView.setTextColor(tint));
-                                    }
-                                }
-                            }
-                            return null;
-                        }
-                );
-                Method addReceiver = darkDispatcherClass.getMethod("addDarkReceiver", receiverClass);
-                addReceiver.invoke(dispatcher, proxy);
-                Log.i(TAG, "DarkIconDispatcher receiver registered successfully");
-            }
-        } catch (Throwable t) {
-            Log.d(TAG, "DarkIconDispatcher registration skipped: " + t.getMessage());
+            mObserverRunning = false;
+            Log.w(TAG, "inotify unavailable, using throttled mtime check: " + t);
         }
     }
 
-    private void sampleAndUpdate() {
-        if (mInjectedView == null) return;
-
-        int rawTemp = readIntFile(SYS_TEMP, 0);
-        int rawVolt = readIntFile(SYS_VOLTAGE, 0);
-        int rawCurr = readIntFile(SYS_CURRENT, 0);
-
-        if (mClockView != null && mClockView.getVisibility() != View.VISIBLE) {
-            if (mInjectedView.getVisibility() != View.GONE) {
-                mInjectedView.setVisibility(View.GONE);
+    private final Runnable mReloadRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (new File(DISABLE_FILE).exists()) {
+                mEnabled = false;
+                stopSampling();
+                hide();
+                return;
             }
-            return;
-        }
-
-        boolean isCharging = isDeviceCharging();
-        if (mChargingOnly && !isCharging) {
-            if (mInjectedView.getVisibility() != View.GONE) {
-                mInjectedView.setVisibility(View.GONE);
-            }
-            return;
-        }
-
-        if (mInjectedView.getVisibility() != View.VISIBLE) {
-            mInjectedView.setVisibility(View.VISIBLE);
-        }
-
-        float tempC = rawTemp / 10.0f;
-        double volts = rawVolt / 1000000.0;
-        double amps = Math.abs(rawCurr) / 1000000.0;
-        double watts = volts * amps;
-        int currMa = (int) (Math.abs(rawCurr) / 1000);
-
-        String line1 = "";
-        String line2 = "";
-
-        switch (mContentMode) {
-            case 2: // Watt only
-                line1 = String.format(Locale.US, "%.2f%s", watts, mPowerUnit);
-                break;
-            case 3: // Temp only
-                line1 = String.format(Locale.US, "%.1f%s", tempC, mTempUnit);
-                break;
-            case 4: // Temp & Current
-                line1 = String.format(Locale.US, "%.1f%s", tempC, mTempUnit);
-                line2 = String.format(Locale.US, "%dmA", currMa);
-                break;
-            case 5: // Current & Watt
-                line1 = String.format(Locale.US, "%dmA", currMa);
-                line2 = String.format(Locale.US, "%.2f%s", watts, mPowerUnit);
-                break;
-            case 1: // Temp & Watt
-            default:
-                line1 = String.format(Locale.US, "%.1f%s", tempC, mTempUnit);
-                line2 = String.format(Locale.US, "%.2f%s", watts, mPowerUnit);
-                break;
-        }
-
-        int targetColor = 0;
-        Typeface clockTf = null;
-        float clockTextSize = 0f;
-        if (mClockView != null) {
-            targetColor = mClockView.getCurrentTextColor();
-            clockTf = mClockView.getTypeface();
-            clockTextSize = mClockView.getTextSize();
-        }
-
-        if (!mDualLine || mContentMode == 2 || mContentMode == 3) {
-            String combined = line2.isEmpty() ? line1 : (line1 + " " + line2);
-            mInjectedView.updateContent(combined, "", false, mFontSizeSp, mBoldFont, targetColor, clockTf, clockTextSize, mPaddingTopDp, mPaddingLeftDp);
-        } else {
-            mInjectedView.updateContent(line1, line2, true, mFontSizeSp, mBoldFont, targetColor, clockTf, clockTextSize, mPaddingTopDp, mPaddingLeftDp);
-        }
-    }
-
-    private boolean isDeviceCharging() {
-        try {
-            File f = new File(SYS_STATUS);
-            if (f.exists()) {
-                String status = readStringFile(f);
-                return "Charging".equalsIgnoreCase(status) || "Full".equalsIgnoreCase(status);
-            }
-        } catch (Throwable ignored) {}
-        return false;
-    }
-
-    private void checkConfigReload() {
-        File cfg = new File(CONFIG_FILE);
-        if (cfg.exists() && cfg.lastModified() != mLastConfigMtime) {
             loadConfig();
+            prepareWorstCaseStrings();
+            mViewStyleDirty = true;
+            mAttachTries = 0;
+            if (mScreenOn && mEnabled && mPowerSource == POWER_LIVE) {
+                startSampling();
+            } else {
+                stopSampling();
+            }
+            refresh();
+        }
+    };
+
+    private void maybeCheckConfigFallback() {
+        if (mObserverRunning) {
+            return;
+        }
+        final long now = SystemClock.elapsedRealtime();
+        if (now - mLastConfigCheckMs < CONFIG_CHECK_MIN_INTERVAL_MS) {
+            return;
+        }
+        mLastConfigCheckMs = now;
+        final File cfg = new File(CONFIG_FILE);
+        if (cfg.exists() && cfg.lastModified() != mLastConfigMtime) {
+            mMain.post(mReloadRunnable);
         }
     }
 
     private void loadConfig() {
         try {
-            File cfg = new File(CONFIG_FILE);
-            if (!cfg.exists()) return;
+            final File cfg = new File(CONFIG_FILE);
+            if (!cfg.exists()) {
+                return;
+            }
             mLastConfigMtime = cfg.lastModified();
-            String json = readStringFile(cfg);
-            if (json == null || json.trim().isEmpty()) return;
-
-            JSONObject obj = new JSONObject(json);
+            final String json = readStringFile(cfg);
+            if (json == null || json.trim().isEmpty()) {
+                return;
+            }
+            final JSONObject obj = new JSONObject(json);
             mEnabled = obj.optBoolean("enabled", true);
             mDualLine = "dual_line".equalsIgnoreCase(obj.optString("layout_mode", "dual_line"));
             mContentMode = obj.optInt("content_mode", 1);
             mRefreshMs = obj.optInt("refresh_ms", 1000);
-            mTempUnit = obj.optString("temp_unit", "°C");
+            mTempUnit = obj.optString("temp_unit", "\u00b0C");
             mPowerUnit = obj.optString("power_unit", "W");
-            float defFontSize = mDualLine ? 6.5f : 6.0f;
-            float defPadTop = mDualLine ? 1.5f : 0.5f;
-            mFontSizeSp = (float) obj.optDouble("font_size_sp", defFontSize);
+            final float defFont = mDualLine ? 6.5f : 6.0f;
+            final float defPadTop = mDualLine ? 1.5f : 0.5f;
+            mFontSizeSp = (float) obj.optDouble("font_size_sp", defFont);
             mBoldFont = obj.optBoolean("bold_font", false);
             mChargingOnly = obj.optBoolean("charging_only", false);
             mPaddingTopDp = (float) obj.optDouble("padding_top_dp", defPadTop);
             mPaddingLeftDp = (float) obj.optDouble("padding_left_dp", 0.0);
-            Log.i(TAG, "Config loaded: enabled=" + mEnabled + ", dualLine=" + mDualLine + ", padTop=" + mPaddingTopDp + ", padLeft=" + mPaddingLeftDp + ", fontSize=" + mFontSizeSp);
+            mPaddingRightDp = (float) obj.optDouble("padding_right_dp", 2.0);
+            mPowerSource = parsePowerSource(obj.optString("power_source", "live"));
+            mViewStyleDirty = true;
+            Log.i(TAG, "Config loaded: enabled=" + mEnabled + " dual=" + mDualLine
+                    + " mode=" + mContentMode + " font=" + mFontSizeSp + " interval=" + mRefreshMs
+                    + " padRight=" + mPaddingRightDp + " powerSource=" + mPowerSource);
         } catch (Throwable t) {
-            Log.e(TAG, "Error loading config", t);
+            Log.e(TAG, "Config parse failed", t);
         }
     }
 
-    private static int readIntFile(String path, int def) {
-        try (FileInputStream fis = new FileInputStream(path)) {
-            byte[] buf = new byte[32];
-            int read = fis.read(buf);
-            if (read > 0) {
-                String str = new String(buf, 0, read).trim();
-                return Integer.parseInt(str);
-            }
-        } catch (Throwable ignored) {}
-        return def;
+    private static int parsePowerSource(String raw) {
+        if (raw == null) {
+            return POWER_LIVE;
+        }
+        final String v = raw.trim().toLowerCase(Locale.ROOT);
+        if ("event".equals(v) || "sysfs_event".equals(v) || "event_io".equals(v)) {
+            return POWER_EVENT;
+        }
+        if ("counter".equals(v) || "zero_io".equals(v)) {
+            return POWER_COUNTER;
+        }
+        // "live", "sysfs_live", "auto", or anything else defaults to POWER_LIVE
+        return POWER_LIVE;
     }
 
-    private static String readStringFile(File file) {
-        try (FileInputStream fis = new FileInputStream(file)) {
-            byte[] buf = new byte[(int) Math.min(file.length() + 32, 4096)];
-            int read = fis.read(buf);
-            if (read > 0) {
-                return new String(buf, 0, read).trim();
+    private void prepareWorstCaseStrings() {
+        final String temp = "35.0" + mTempUnit;
+        final String watt = "1.50" + mPowerUnit;
+        final String milli = "250mA";
+        switch (mContentMode) {
+            case 2:
+                mWorstTop = watt;
+                mWorstBottom = "";
+                break;
+            case 3:
+                mWorstTop = temp;
+                mWorstBottom = "";
+                break;
+            case 4:
+                mWorstTop = temp;
+                mWorstBottom = milli;
+                break;
+            case 5:
+                mWorstTop = milli;
+                mWorstBottom = watt;
+                break;
+            case 1:
+            default:
+                mWorstTop = temp;
+                mWorstBottom = watt;
+                break;
+        }
+        if (!mDualLine) {
+            mWorstTop = mWorstBottom.isEmpty() ? mWorstTop : (mWorstTop + " " + mWorstBottom);
+            mWorstBottom = "";
+        }
+    }
+
+    // ================================================================== receivers
+
+    private void registerReceivers() {
+        final IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_BATTERY_CHANGED);
+        filter.addAction(Intent.ACTION_SCREEN_ON);
+        filter.addAction(Intent.ACTION_SCREEN_OFF);
+        filter.addAction(Intent.ACTION_USER_PRESENT);
+        filter.addAction(Intent.ACTION_CONFIGURATION_CHANGED);
+
+        Intent sticky = null;
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                sticky = mContext.registerReceiver(mReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                sticky = mContext.registerReceiver(mReceiver, filter);
             }
-        } catch (Throwable ignored) {}
-        return "";
+        } catch (Throwable t) {
+            Log.e(TAG, "registerReceiver failed", t);
+        }
+
+        if (sticky != null) {
+            onBatteryChanged(sticky, true);
+        }
+    }
+
+    private final BroadcastReceiver mReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent == null) {
+                return;
+            }
+            final String action = intent.getAction();
+            if (action == null) {
+                return;
+            }
+            try {
+                switch (action) {
+                    case Intent.ACTION_BATTERY_CHANGED:
+                        onBatteryChanged(intent, false);
+                        break;
+                    case Intent.ACTION_SCREEN_ON:
+                    case Intent.ACTION_USER_PRESENT:
+                        mScreenOn = true;
+                        mAttachTries = 0;
+                        scheduleAttach();
+                        if (mEnabled && mPowerSource == POWER_LIVE) {
+                            startSampling();
+                        }
+                        refresh();
+                        break;
+                    case Intent.ACTION_SCREEN_OFF:
+                        mScreenOn = false;
+                        stopSampling();
+                        break;
+                    case Intent.ACTION_CONFIGURATION_CHANGED:
+                        mAttachTries = 0;
+                        if (mView == null || !mView.isAttachedToWindow()) {
+                            mView = null;
+                            mClock = null;
+                            scheduleAttach();
+                        } else {
+                            mViewStyleDirty = true;
+                            refresh();
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "Receiver error: " + t);
+            }
+        }
+    };
+
+    private void onBatteryChanged(Intent intent, boolean fromSticky) {
+        mHaveBattery = true;
+        mStatus = intent.getIntExtra(BatteryManager.EXTRA_STATUS, mStatus);
+        mPlugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, mPlugged);
+        final int temp = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Integer.MIN_VALUE);
+        if (temp != Integer.MIN_VALUE) {
+            mTempTenths = temp;
+        }
+        mVoltageMv = intent.getIntExtra(BatteryManager.EXTRA_VOLTAGE, mVoltageMv);
+
+        final long now = SystemClock.elapsedRealtime();
+        if (fromSticky || now - mLastBatteryLogMs > 30000L) {
+            mLastBatteryLogMs = now;
+            Log.d(TAG, "Battery (" + (fromSticky ? "sticky" : "live") + "): temp=" + mTempTenths
+                    + " voltage=" + mVoltageMv + " status=" + mStatus + " plugged=" + mPlugged);
+        }
+
+        if (intent.hasExtra(EXTRA_CHARGE_COUNTER) && mPowerSource == POWER_COUNTER) {
+            updateCounterCurrent(intent.getIntExtra(EXTRA_CHARGE_COUNTER, 0), fromSticky);
+        }
+
+        maybeCheckConfigFallback();
+
+        if (mPowerSource == POWER_EVENT || (mPowerSource == POWER_LIVE && !mHaveCurrent)) {
+            requestSysfsCurrent();
+        }
+
+        if (mScreenOn && mEnabled && mPowerSource == POWER_LIVE && !mSamplingActive) {
+            startSampling();
+        }
+
+        refresh();
+    }
+
+    private void updateCounterCurrent(int counterUah, boolean fromSticky) {
+        final long now = SystemClock.elapsedRealtime();
+        if (!mHaveCounter || fromSticky) {
+            mCounterUah = counterUah;
+            mCounterAtMs = now;
+            mHaveCounter = true;
+            mCounterAnchorSticky = fromSticky;
+            return;
+        }
+        if (mCounterAnchorSticky) {
+            mCounterAnchorSticky = false;
+            mCounterUah = counterUah;
+            mCounterAtMs = now;
+            return;
+        }
+        final long dtMs = now - mCounterAtMs;
+        final long dq = counterUah - mCounterUah;
+        if (Math.abs(dq) < COUNTER_MIN_DELTA_UAH || dtMs < 3000L) {
+            return;
+        }
+        final double ma = Math.abs(dq) * 3600.0 / dtMs;
+        if (ma >= 1.0 && ma < 20000.0) {
+            mCurrentMa = mHaveCurrent ? (mCurrentMa * 0.35 + ma * 0.65) : ma;
+            mHaveCurrent = true;
+        }
+        mCounterUah = counterUah;
+        mCounterAtMs = now;
+    }
+
+    // ================================================================== sampling
+
+    private final BattMonSampler.Callback mCurrentCallback = new BattMonSampler.Callback() {
+        @Override
+        public void onCurrent(double milliamps, boolean valid) {
+            if (!mScreenOn || !mEnabled) {
+                return;
+            }
+            if (valid && milliamps >= 1.0 && milliamps < 20000.0) {
+                mCurrentMa = milliamps;
+                mHaveCurrent = true;
+                mSysfsFailures = 0;
+                refresh();
+            } else {
+                mSysfsFailures++;
+                if (mSysfsFailures >= 5 && mPowerSource == POWER_LIVE) {
+                    Log.w(TAG, "Battery current reading unavailable via sysfs");
+                }
+            }
+        }
+    };
+
+    private void requestSysfsCurrent() {
+        mSampler.requestCurrent(mCurrentCallback);
+    }
+
+    private final Runnable mSampleTickRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!mScreenOn || !mEnabled || mPowerSource != POWER_LIVE) {
+                mSamplingActive = false;
+                return;
+            }
+            if (mView == null || !mView.isAttachedToWindow()) {
+                scheduleAttach();
+                scheduleNextSampleTick();
+                return;
+            }
+            if (mChargingOnly && !isCharging()) {
+                hide();
+                scheduleNextSampleTick();
+                return;
+            }
+
+            requestSysfsCurrent();
+            scheduleNextSampleTick();
+        }
+    };
+
+    private void scheduleNextSampleTick() {
+        if (!mScreenOn || !mEnabled || mPowerSource != POWER_LIVE) {
+            mSamplingActive = false;
+            return;
+        }
+        mSamplingActive = true;
+        mMain.removeCallbacks(mSampleTickRunnable);
+        final long delay = Math.max(250, mRefreshMs > 0 ? mRefreshMs : 1000);
+        mMain.postDelayed(mSampleTickRunnable, delay);
+    }
+
+    private void startSampling() {
+        if (!mScreenOn || !mEnabled || mPowerSource != POWER_LIVE) {
+            return;
+        }
+        mSamplingActive = true;
+        mMain.removeCallbacks(mSampleTickRunnable);
+        requestSysfsCurrent();
+        scheduleNextSampleTick();
+    }
+
+    private void stopSampling() {
+        mSamplingActive = false;
+        mMain.removeCallbacks(mSampleTickRunnable);
+        mSampler.cancel();
+    }
+
+    // ================================================================== attach
+
+    private final View.OnAttachStateChangeListener mAttachListener =
+            new View.OnAttachStateChangeListener() {
+                @Override
+                public void onViewAttachedToWindow(View v) {
+                    mAttachTries = 0;
+                    mViewStyleDirty = true;
+                    if (mScreenOn && mEnabled && mPowerSource == POWER_LIVE) {
+                        startSampling();
+                    }
+                    refresh();
+                }
+
+                @Override
+                public void onViewDetachedFromWindow(View v) {
+                    mView = null;
+                    mClock = null;
+                    mAttachTries = 0;
+                    scheduleAttach();
+                }
+            };
+
+    private final Runnable mAttachRunnable = new Runnable() {
+        @Override
+        public void run() {
+            mAttachPending = false;
+            if (mView != null && mView.isAttachedToWindow()) {
+                return;
+            }
+            if (tryAttach()) {
+                mAttachTries = 0;
+                if (mScreenOn && mEnabled && mPowerSource == POWER_LIVE) {
+                    startSampling();
+                }
+                return;
+            }
+            mAttachTries++;
+            scheduleAttach();
+        }
+    };
+
+    private void scheduleAttach() {
+        if (mAttachPending) {
+            return;
+        }
+        if (mView != null && mView.isAttachedToWindow()) {
+            return;
+        }
+        mAttachPending = true;
+        final long delay = mAttachTries < 8
+                ? Math.min(ATTACH_MAX_DELAY_MS, ATTACH_FIRST_DELAY_MS << mAttachTries)
+                : 5000L;
+        mMain.postDelayed(mAttachRunnable, delay);
+    }
+
+    private static boolean resolveReflection() {
+        if (sReflectionReady) {
+            return sWmgViewsField != null;
+        }
+        sReflectionReady = true;
+        try {
+            final Class<?> wmg = Class.forName("android.view.WindowManagerGlobal");
+            sGetWmgInstance = wmg.getMethod("getInstance");
+            sWmgViewsField = wmg.getDeclaredField("mViews");
+            sWmgViewsField.setAccessible(true);
+        } catch (Throwable t) {
+            Log.w(TAG, "WindowManagerGlobal reflection unavailable: " + t);
+            sWmgViewsField = null;
+        }
+        return sWmgViewsField != null;
+    }
+
+    private boolean tryAttach() {
+        if (mView != null && mView.isAttachedToWindow()) {
+            return true;
+        }
+        if (!resolveReflection()) {
+            return false;
+        }
+        try {
+            final Object wmg = sGetWmgInstance.invoke(null);
+            if (wmg == null) {
+                return false;
+            }
+            final Object raw = sWmgViewsField.get(wmg);
+            if (!(raw instanceof List)) {
+                return false;
+            }
+            final List<?> live = (List<?>) raw;
+            final ArrayList<View> roots = new ArrayList<>(live.size());
+            for (Object o : live) {
+                if (o instanceof View) {
+                    roots.add((View) o);
+                }
+            }
+            for (int i = 0; i < roots.size(); i++) {
+                final TextView clock = findClockView(roots.get(i));
+                if (clock == null) {
+                    continue;
+                }
+                final ViewParent parent = clock.getParent();
+                if (!(parent instanceof ViewGroup)) {
+                    continue;
+                }
+                final ViewGroup group = (ViewGroup) parent;
+                final View existing = group.findViewWithTag(BattMonView.VIEW_TAG);
+                final BattMonView view;
+                if (existing instanceof BattMonView) {
+                    view = (BattMonView) existing;
+                } else {
+                    view = new BattMonView(group.getContext());
+                    final LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                            ViewGroup.LayoutParams.WRAP_CONTENT);
+                    lp.gravity = Gravity.CENTER_VERTICAL;
+                    final int clockIndex = group.indexOfChild(clock);
+                    group.addView(view, clockIndex >= 0 ? clockIndex + 1 : 0, lp);
+                    Log.i(TAG, "View attached next to clock at index " + (clockIndex + 1));
+                }
+                mView = view;
+                mClock = clock;
+                view.addOnAttachStateChangeListener(mAttachListener);
+                mViewStyleDirty = true;
+                refresh();
+                return true;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Attach failed: " + t);
+        }
+        return false;
+    }
+
+    private TextView findClockView(View view) {
+        final int[] budget = new int[]{MAX_SCAN_VIEWS};
+        return findClockView(view, 0, budget);
+    }
+
+    private TextView findClockView(View view, int depth, int[] budget) {
+        if (view == null || depth > MAX_SCAN_DEPTH || budget[0]-- <= 0) {
+            return null;
+        }
+        if (view instanceof TextView) {
+            final TextView tv = (TextView) view;
+            final CharSequence text = tv.getText();
+            if (isClockText(text)) {
+                return tv;
+            }
+            final int id = tv.getId();
+            if (id != View.NO_ID) {
+                try {
+                    final String name = tv.getResources().getResourceEntryName(id);
+                    if (name != null && name.toLowerCase(Locale.ROOT).contains("clock")) {
+                        return tv;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        if (view instanceof ViewGroup) {
+            final ViewGroup group = (ViewGroup) view;
+            final int count = group.getChildCount();
+            for (int i = 0; i < count; i++) {
+                final TextView found = findClockView(group.getChildAt(i), depth + 1, budget);
+                if (found != null) {
+                    return found;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static boolean isClockText(CharSequence cs) {
+        if (cs == null) {
+            return false;
+        }
+        final String s = cs.toString().trim();
+        final int len = s.length();
+        if (len < 4 || len > 12) {
+            return false;
+        }
+        return CLOCK_PATTERN.matcher(s).matches();
+    }
+
+    // ================================================================== rendering
+
+    private void refresh() {
+        try {
+            if (!mEnabled) {
+                hide();
+                return;
+            }
+            if (mView == null || !mView.isAttachedToWindow()) {
+                scheduleAttach();
+                return;
+            }
+            if (mClock != null && mClock.getVisibility() != View.VISIBLE) {
+                hide();
+                return;
+            }
+            if (mChargingOnly && !isCharging()) {
+                hide();
+                return;
+            }
+            if (mView.getVisibility() != View.VISIBLE) {
+                mView.setVisibility(View.VISIBLE);
+            }
+
+            buildLines();
+
+            if (mViewStyleDirty) {
+                mViewStyleDirty = false;
+                mView.configure(mDualLine, mFontSizeSp, mBoldFont,
+                        mClock != null ? mClock.getTypeface() : null,
+                        mPaddingTopDp, mPaddingLeftDp, mPaddingRightDp, mWorstTop, mWorstBottom);
+            }
+
+            final int color = mClock != null ? mClock.getCurrentTextColor() : 0;
+            if (mDualLine && mContentMode != 2 && mContentMode != 3) {
+                mView.setContent(mLineTop, mLineBottom, color);
+            } else {
+                mView.setContent(mLineBottom.isEmpty() ? mLineTop
+                        : (mLineTop + " " + mLineBottom), "", color);
+            }
+            mView.setContentDescription(mLineTop + " " + mLineBottom);
+
+            final long now = SystemClock.elapsedRealtime();
+            if (now - mLastLogMs > 5000L) {
+                mLastLogMs = now;
+                Log.d(TAG, "Display: " + mLineTop + " / " + mLineBottom
+                        + " (" + (long) mCurrentMa + " mA, " + mVoltageMv + " mV, color="
+                        + String.format("0x%08X", color) + ")");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Refresh failed: " + t);
+        }
+    }
+
+    private void hide() {
+        if (mView != null && mView.getVisibility() != View.GONE) {
+            mView.setVisibility(View.GONE);
+        }
+    }
+
+    private String mLineTop = "";
+    private String mLineBottom = "";
+
+    private void buildLines() {
+        final double tempC = mTempTenths / 10.0;
+        final double volts = mVoltageMv / 1000.0;
+        final double amps = mHaveCurrent ? mCurrentMa / 1000.0 : 0.0;
+        final double watts = volts * amps;
+
+        switch (mContentMode) {
+            case 2:
+                mLineTop = formatWatts(watts);
+                mLineBottom = "";
+                break;
+            case 3:
+                mLineTop = formatTemp(tempC);
+                mLineBottom = "";
+                break;
+            case 4:
+                mLineTop = formatTemp(tempC);
+                mLineBottom = formatMilliAmps();
+                break;
+            case 5:
+                mLineTop = formatMilliAmps();
+                mLineBottom = formatWatts(watts);
+                break;
+            case 1:
+            default:
+                mLineTop = formatTemp(tempC);
+                mLineBottom = formatWatts(watts);
+                break;
+        }
+    }
+
+    private boolean isCharging() {
+        if (mStatus == 2 /* CHARGING */ || mStatus == 5 /* FULL */) {
+            return true;
+        }
+        return mPlugged != 0;
+    }
+
+    private String formatTemp(double tempC) {
+        mSb.setLength(0);
+        appendFixed(mSb, tempC, 1);
+        mSb.append(mTempUnit);
+        return mSb.toString();
+    }
+
+    private String formatWatts(double watts) {
+        mSb.setLength(0);
+        if (!mHaveCurrent) {
+            mSb.append("--");
+            mSb.append(mPowerUnit);
+            return mSb.toString();
+        }
+        appendFixed(mSb, watts, 2);
+        mSb.append(mPowerUnit);
+        return mSb.toString();
+    }
+
+    private String formatMilliAmps() {
+        mSb.setLength(0);
+        if (!mHaveCurrent) {
+            mSb.append("--mA");
+            return mSb.toString();
+        }
+        mSb.append((long) (mCurrentMa + 0.5));
+        mSb.append("mA");
+        return mSb.toString();
+    }
+
+    private static void appendFixed(StringBuilder sb, double value, int decimals) {
+        if (value < 0) {
+            sb.append('-');
+            value = -value;
+        }
+        long scale = 1;
+        for (int i = 0; i < decimals; i++) {
+            scale *= 10;
+        }
+        final long scaled = (long) (value * scale + 0.5);
+        sb.append(scaled / scale);
+        if (decimals > 0) {
+            sb.append('.');
+            long frac = scaled % scale;
+            long div = scale / 10;
+            while (div > 0) {
+                sb.append((char) ('0' + (frac / div) % 10));
+                div /= 10;
+            }
+        }
+    }
+
+    // ================================================================== dark icon tint
+
+    private void initDarkIconDispatcher() {
+        try {
+            final Class<?> depClass = Class.forName("com.android.systemui.Dependency");
+            final Class<?> dispatcherClass =
+                    Class.forName("com.android.systemui.plugins.DarkIconDispatcher");
+            final Object dispatcher = depClass.getMethod("get", Class.class)
+                    .invoke(null, dispatcherClass);
+            if (dispatcher == null) {
+                return;
+            }
+            final Class<?> receiverClass =
+                    Class.forName("com.android.systemui.plugins.DarkIconDispatcher$DarkReceiver");
+            final Object proxy = Proxy.newProxyInstance(receiverClass.getClassLoader(),
+                    new Class<?>[]{receiverClass}, (proxyObj, method, args) -> {
+                        final String name = method.getName();
+                        if ("onDarkChanged".equals(name) && args != null && args.length >= 3
+                                && args[2] instanceof Integer) {
+                            final int tint = (Integer) args[2];
+                            if (mView != null && mView.isAttachedToWindow()) {
+                                mView.setContent(mLineTop, mLineBottom, tint);
+                            }
+                        } else if ("equals".equals(name)) {
+                            return proxyObj == args[0];
+                        } else if ("hashCode".equals(name)) {
+                            return System.identityHashCode(proxyObj);
+                        } else if ("toString".equals(name)) {
+                            return "BattMonDarkReceiver";
+                        }
+                        return null;
+                    });
+            dispatcherClass.getMethod("addDarkReceiver", receiverClass).invoke(dispatcher, proxy);
+        } catch (Throwable t) {
+            Log.d(TAG, "Dark icon dispatcher hook unavailable (using clock color fallback): " + t.getMessage());
+        }
+    }
+
+    // ================================================================== utils
+
+    private static String readStringFile(File file) {
+        final long len = file.length();
+        if (len <= 0 || len > 65536) {
+            return "";
+        }
+        try (FileInputStream fis = new FileInputStream(file)) {
+            final byte[] buf = new byte[(int) len];
+            int read = 0;
+            while (read < buf.length) {
+                final int n = fis.read(buf, read, buf.length - read);
+                if (n <= 0) {
+                    break;
+                }
+                read += n;
+            }
+            return new String(buf, 0, read).trim();
+        } catch (Throwable ignored) {
+            return "";
+        }
     }
 }

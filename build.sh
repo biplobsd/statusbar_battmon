@@ -26,6 +26,7 @@ echo "  d8: $D8"
 echo "  Android Jar: $ANDROID_JAR"
 
 mkdir -p build/classes build/dex build/module_stage output
+rm -f "$PROJECT_DIR"/output/*.zip
 
 echo "[2/5] Compiling Java code to DEX..."
 javac -source 17 -target 17 -d build/classes -classpath "$ANDROID_JAR" src/java/com/battmon/*.java
@@ -74,6 +75,7 @@ cat << 'EOF' > build/module_stage/config.json
   "layout_mode": "dual_line",
   "content_mode": 1,
   "refresh_ms": 1000,
+  "power_source": "live",
   "temp_unit": "°C",
   "power_unit": "W",
   "font_size_sp": 6.5,
@@ -89,10 +91,9 @@ MODULE_VER=$(grep "^version=" module/module.prop | cut -d= -f2 | tr -d '\r')
 
 cd build/module_stage
 zip -r -9 "$PROJECT_DIR/output/statusbar_battmon-${MODULE_VER}.zip" ./*
-cp "$PROJECT_DIR/output/statusbar_battmon-${MODULE_VER}.zip" "$PROJECT_DIR/output/statusbar_battmon.zip"
 cd "$PROJECT_DIR"
 
 echo "=== Build Complete! ==="
 ls -lh output/
-unzip -l output/statusbar_battmon.zip
+unzip -l "$PROJECT_DIR/output/statusbar_battmon-${MODULE_VER}.zip"
 

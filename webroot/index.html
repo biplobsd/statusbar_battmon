@@ -403,6 +403,15 @@
 
         <div class="slider-container">
             <div class="slider-header">
+                <span>Right Spacing (Padding Right)</span>
+                <span id="padRightDisplay" class="slider-val">2.0 dp</span>
+            </div>
+            <div class="setting-desc" style="margin-top:2px;">Horizontal gap before notification icons</div>
+            <input type="range" id="cfgPadRight" min="0.0" max="8.0" step="0.5" value="2.0">
+        </div>
+
+        <div class="slider-container">
+            <div class="slider-header">
                 <span>Font Size</span>
                 <span id="fontSizeDisplay" class="slider-val">6.5 sp</span>
             </div>
@@ -412,13 +421,26 @@
 
         <div class="setting-col" style="margin-top: 10px;">
             <div class="setting-info">
+                <div class="setting-name">Power Source</div>
+                <div class="setting-desc">Live background sampling provides real-time wattage (pauses when screen is off)</div>
+            </div>
+            <select id="cfgPowerSource">
+                <option value="live" selected>Live Sampling — Real-time wattage (Recommended)</option>
+                <option value="event">Battery Event Only — Updates on battery intent (~mins)</option>
+                <option value="counter">Charge Counter Only — Zero file reads (Approximate)</option>
+            </select>
+        </div>
+
+        <div class="setting-col" style="margin-top: 10px;">
+            <div class="setting-info">
                 <div class="setting-name">Refresh Interval</div>
-                <div class="setting-desc">Update speed (automatically paused when screen is off)</div>
+                <div class="setting-desc">Update speed while screen is on (automatically stops with zero CPU when screen is off)</div>
             </div>
             <select id="cfgInterval">
                 <option value="500">500 ms (Fast)</option>
-                <option value="1000" selected>1000 ms (Balanced - Recommended)</option>
-                <option value="2000">2000 ms (Battery Saver)</option>
+                <option value="1000" selected>1000 ms (1 Hz - Balanced, Recommended)</option>
+                <option value="2000">2000 ms (Relaxed)</option>
+                <option value="3000">3000 ms (Battery Saver)</option>
             </select>
         </div>
     </div>
@@ -442,45 +464,153 @@
             layout_mode: "dual_line",
             content_mode: 1,
             refresh_ms: 1000,
+            power_source: "live",
             temp_unit: "°C",
             power_unit: "W",
             font_size_sp: 6.5,
             bold_font: false,
             charging_only: false,
             padding_top_dp: 1.5,
-            padding_left_dp: 0.0
+            padding_left_dp: 0.0,
+            padding_right_dp: 2.0
         };
 
-        // KSU exec helper
-        async function runRoot(cmd) {
-            if (typeof ksu !== 'undefined' && ksu.exec) {
-                return await ksu.exec(cmd);
-            }
-            return { errno: -1, stdout: "", stderr: "Not in KernelSU environment" };
+        let callbackCounter = 0;
+        function getUniqueCallbackName(prefix) {
+            return `${prefix}_cb_${Date.now()}_${callbackCounter++}`;
+        }
+
+        // KSU exec helper supporting standard KernelSU, MMRL, and modern Promise-based wrappers
+        function runRoot(command, options = {}) {
+            return new Promise((resolve) => {
+                if (typeof ksu === 'undefined' || !ksu.exec) {
+                    resolve({ errno: -1, stdout: "", stderr: "KernelSU bridge not detected" });
+                    return;
+                }
+
+                const callbackFuncName = getUniqueCallbackName("exec");
+                let resolved = false;
+
+                const timer = setTimeout(() => {
+                    if (!resolved) {
+                        resolved = true;
+                        if (window[callbackFuncName]) delete window[callbackFuncName];
+                        resolve({ errno: -1, stdout: "", stderr: "Command timed out" });
+                    }
+                }, 10000);
+
+                window[callbackFuncName] = (errno, stdout, stderr) => {
+                    if (!resolved) {
+                        resolved = true;
+                        clearTimeout(timer);
+                        delete window[callbackFuncName];
+                        resolve({ errno, stdout, stderr });
+                    }
+                };
+
+                try {
+                    const optStr = typeof options === 'string' ? options : JSON.stringify(options);
+                    // Standard KernelSU signature: exec(command, optionsJsonStr, callbackName)
+                    const ret = ksu.exec(command, optStr, callbackFuncName);
+
+                    if (ret && typeof ret.then === 'function') {
+                        ret.then((res) => {
+                            if (!resolved) {
+                                resolved = true;
+                                clearTimeout(timer);
+                                delete window[callbackFuncName];
+                                resolve(res);
+                            }
+                        }).catch((err) => {
+                            if (!resolved) {
+                                resolved = true;
+                                clearTimeout(timer);
+                                delete window[callbackFuncName];
+                                resolve({ errno: -1, stdout: "", stderr: String(err) });
+                            }
+                        });
+                    } else if (ret && typeof ret === 'object' && ('errno' in ret || 'stdout' in ret)) {
+                        if (!resolved) {
+                            resolved = true;
+                            clearTimeout(timer);
+                            delete window[callbackFuncName];
+                            resolve(ret);
+                        }
+                    }
+                } catch (err1) {
+                    try {
+                        const ret2 = ksu.exec(command);
+                        if (ret2 && typeof ret2.then === 'function') {
+                            ret2.then((res) => {
+                                if (!resolved) {
+                                    resolved = true;
+                                    clearTimeout(timer);
+                                    delete window[callbackFuncName];
+                                    resolve(res);
+                                }
+                            }).catch((err) => {
+                                if (!resolved) {
+                                    resolved = true;
+                                    clearTimeout(timer);
+                                    delete window[callbackFuncName];
+                                    resolve({ errno: -1, stdout: "", stderr: String(err) });
+                                }
+                            });
+                        } else if (ret2 && typeof ret2 === 'object' && ('errno' in ret2 || 'stdout' in ret2)) {
+                            if (!resolved) {
+                                resolved = true;
+                                clearTimeout(timer);
+                                delete window[callbackFuncName];
+                                resolve(ret2);
+                            }
+                        } else {
+                            if (!resolved) {
+                                resolved = true;
+                                clearTimeout(timer);
+                                delete window[callbackFuncName];
+                                resolve({ errno: -1, stdout: "", stderr: String(err1) });
+                            }
+                        }
+                    } catch (err2) {
+                        if (!resolved) {
+                            resolved = true;
+                            clearTimeout(timer);
+                            delete window[callbackFuncName];
+                            resolve({ errno: -1, stdout: "", stderr: String(err2) });
+                        }
+                    }
+                }
+            });
         }
 
         function showToast(msg) {
             const toast = document.getElementById("toast");
-            toast.textContent = msg;
-            toast.classList.add("show");
-            setTimeout(() => toast.classList.remove("show"), 2500);
+            if (toast) {
+                toast.textContent = msg;
+                toast.classList.add("show");
+                setTimeout(() => toast.classList.remove("show"), 2500);
+            }
         }
 
         // Load config from device
         async function loadDeviceConfig() {
             try {
                 const res = await runRoot(`cat ${CONFIG_PATH} 2>/dev/null`);
-                if (res.errno === 0 && res.stdout) {
+                if (res && res.errno === 0 && res.stdout) {
                     const parsed = JSON.parse(res.stdout);
                     currentConfig = Object.assign(currentConfig, parsed);
                 }
-            } catch (e) {}
+            } catch (e) {
+                console.warn("Could not parse device config", e);
+            }
 
             document.getElementById("cfgEnabled").checked = currentConfig.enabled !== false;
             const layout = currentConfig.layout_mode || "dual_line";
             document.getElementById("cfgLayout").value = layout;
             document.getElementById("cfgContentMode").value = currentConfig.content_mode || 1;
             document.getElementById("cfgInterval").value = currentConfig.refresh_ms || 1000;
+            const pSrc = currentConfig.power_source || "live";
+            document.getElementById("cfgPowerSource").value = (pSrc === "auto" || pSrc === "sysfs_live") ? "live" : ((pSrc === "sysfs_event") ? "event" : pSrc);
             document.getElementById("cfgChargingOnly").checked = !!currentConfig.charging_only;
             
             const isDual = layout === "dual_line";
@@ -495,6 +625,10 @@
             document.getElementById("cfgPadLeft").value = padLeft;
             document.getElementById("padLeftDisplay").textContent = padLeft + " dp";
 
+            const padRight = currentConfig.padding_right_dp !== undefined ? currentConfig.padding_right_dp : 2.0;
+            document.getElementById("cfgPadRight").value = padRight;
+            document.getElementById("padRightDisplay").textContent = padRight + " dp";
+
             const fSize = currentConfig.font_size_sp !== undefined ? currentConfig.font_size_sp : defFont;
             document.getElementById("cfgFontSize").value = fSize;
             document.getElementById("fontSizeDisplay").textContent = fSize + " sp";
@@ -506,18 +640,22 @@
             currentConfig.layout_mode = document.getElementById("cfgLayout").value;
             currentConfig.content_mode = parseInt(document.getElementById("cfgContentMode").value);
             currentConfig.refresh_ms = parseInt(document.getElementById("cfgInterval").value);
+            currentConfig.power_source = document.getElementById("cfgPowerSource").value;
             currentConfig.charging_only = document.getElementById("cfgChargingOnly").checked;
             currentConfig.font_size_sp = parseFloat(document.getElementById("cfgFontSize").value);
             currentConfig.padding_top_dp = parseFloat(document.getElementById("cfgPadTop").value);
             currentConfig.padding_left_dp = parseFloat(document.getElementById("cfgPadLeft").value);
+            currentConfig.padding_right_dp = parseFloat(document.getElementById("cfgPadRight").value);
 
             const json = JSON.stringify(currentConfig, null, 2);
-            const cmd = `mkdir -p /data/local/tmp/battmon && echo '${json.replace(/'/g, "'\\''")}' > ${CONFIG_PATH} && chmod 644 ${CONFIG_PATH} && chcon u:object_r:system_file:s0 ${CONFIG_PATH}`;
+            const b64 = btoa(unescape(encodeURIComponent(json)));
+            const cmd = `mkdir -p /data/local/tmp/battmon && echo "${b64}" | base64 -d > ${CONFIG_PATH} && chmod 644 ${CONFIG_PATH} && chcon u:object_r:system_file:s0 ${CONFIG_PATH} && cp -f ${CONFIG_PATH} /data/adb/modules/statusbar_battmon/config.json 2>/dev/null; true`;
             const res = await runRoot(cmd);
-            if (res.errno === 0) {
+            if (res && res.errno === 0) {
                 showToast("✓ Settings Applied Live!");
             } else {
-                showToast("Error saving config");
+                const errDetail = (res && (res.stderr || res.stdout)) ? (res.stderr || res.stdout) : ("code " + (res ? res.errno : "unknown"));
+                showToast("Error saving config: " + errDetail);
             }
         }
 
@@ -540,6 +678,11 @@
         document.getElementById("cfgPadLeft").addEventListener("input", (e) => {
             const v = parseFloat(e.target.value);
             document.getElementById("padLeftDisplay").textContent = v + " dp";
+        });
+
+        document.getElementById("cfgPadRight").addEventListener("input", (e) => {
+            const v = parseFloat(e.target.value);
+            document.getElementById("padRightDisplay").textContent = v + " dp";
         });
 
         document.getElementById("cfgFontSize").addEventListener("input", (e) => {

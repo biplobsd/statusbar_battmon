@@ -2,6 +2,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <android/log.h>
+#include <atomic>
 #include <cstring>
 #include <cstdio>
 #include <vector>
@@ -14,150 +15,187 @@
 
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
+using zygisk::ServerSpecializeArgs;
 
-static void* InitWorker(void* arg) {
-    JavaVM* vm = reinterpret_cast<JavaVM*>(arg);
-    JNIEnv* env = nullptr;
+namespace {
+
+constexpr const char *kTargetPackage = "com.android.systemui";
+constexpr const char *kDynamicDexPath = "/data/local/tmp/battmon/classes.dex";
+constexpr const char *kEntryClass = "com.battmon.BattMon";
+
+// ---------------------------------------------------------------------------
+// DEX keep-alive buffer.
+//
+// dalvik.system.DexFile#createCookieWithDirectBuffer reads the buffer address with
+// Buffer.address(buffer) and hands that raw pointer to ART; the class loader keeps
+// referencing that memory for the whole process lifetime (no copy is made). The buffer
+// backing an InMemoryDexClassLoader therefore has to stay alive - and unchanged - until
+// the process dies. Holding it in a translation-unit static (instead of a stack vector
+// inside the worker, which used to be freed on return) removes a real use-after-free
+// that could take SystemUI down at an arbitrary later point.
+// ---------------------------------------------------------------------------
+std::vector<unsigned char> g_dex_keepalive;
+
+std::atomic<bool> g_worker_started{false};
+
+jobject GetApplication(JNIEnv *env) {
+    jclass activity_thread = nullptr;
+    jmethodID current_application = nullptr;
+
+    // The JVM needs a moment before ActivityThread.currentApplication() returns the
+    // Application instance. Wait without burning CPU, and resolve symbols only once.
+    for (int attempt = 0; attempt < 120; ++attempt) {
+        if (activity_thread == nullptr) {
+            activity_thread = env->FindClass("android/app/ActivityThread");
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                activity_thread = nullptr;
+            }
+        }
+        if (activity_thread != nullptr && current_application == nullptr) {
+            current_application = env->GetStaticMethodID(
+                    activity_thread, "currentApplication", "()Landroid/app/Application;");
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                current_application = nullptr;
+            }
+        }
+        if (activity_thread != nullptr && current_application != nullptr) {
+            jobject app = env->CallStaticObjectMethod(activity_thread, current_application);
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                app = nullptr;
+            }
+            if (app != nullptr) {
+                return app;
+            }
+        }
+        // 50 ms -> 400 ms backoff; bounded at ~10 s total.
+        usleep(attempt < 20 ? 50000 : (attempt < 40 ? 200000 : 400000));
+    }
+    return nullptr;
+}
+
+void *InitWorker(void *arg) {
+    JavaVM *vm = reinterpret_cast<JavaVM *>(arg);
+    JNIEnv *env = nullptr;
     if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
         LOGE("Failed to attach worker thread to JVM");
         return nullptr;
     }
 
-    LOGI("InitWorker running inside com.android.systemui (pid=%d)", getpid());
+    LOGI("InitWorker running inside %s (pid=%d)", kTargetPackage, getpid());
 
-    jclass actThreadClass = nullptr;
-    jmethodID currentAppMethod = nullptr;
-    jobject appObj = nullptr;
-
-    // Retry loop waiting for ActivityThread.currentApplication() to become ready
-    for (int i = 0; i < 120; i++) {
-        usleep(100000); // 100ms
-        if (!actThreadClass) {
-            actThreadClass = env->FindClass("android/app/ActivityThread");
-            if (env->ExceptionCheck()) {
-                env->ExceptionClear();
-                actThreadClass = nullptr;
-                continue;
-            }
-        }
-        if (!currentAppMethod && actThreadClass) {
-            currentAppMethod = env->GetStaticMethodID(actThreadClass, "currentApplication", "()Landroid/app/Application;");
-            if (env->ExceptionCheck()) {
-                env->ExceptionClear();
-                currentAppMethod = nullptr;
-                continue;
-            }
-        }
-        if (currentAppMethod && actThreadClass) {
-            appObj = env->CallStaticObjectMethod(actThreadClass, currentAppMethod);
-            if (env->ExceptionCheck()) {
-                env->ExceptionClear();
-                appObj = nullptr;
-            }
-            if (appObj != nullptr) {
-                break;
-            }
-        }
-    }
-
-    if (!appObj) {
-        LOGE("Timed out waiting for Application instance");
+    jobject app = GetApplication(env);
+    if (app == nullptr) {
+        LOGE("Timed out waiting for the Application instance");
         vm->DetachCurrentThread();
         return nullptr;
     }
 
-    // Determine DEX source: dynamic file on disk if present, else embedded fallback
-    const char* dynamic_dex_path = "/data/local/tmp/battmon/classes.dex";
-    std::vector<unsigned char> file_buf;
-    const unsigned char* dex_bytes = battmon_dex;
-    size_t dex_size = battmon_dex_len;
-
-    FILE* df = fopen(dynamic_dex_path, "rb");
-    if (df) {
+    // Prefer an updated DEX from disk, otherwise use the embedded fallback. Either way the
+    // bytes are copied into g_dex_keepalive so they outlive this thread.
+    bool dynamic = false;
+    FILE *df = fopen(kDynamicDexPath, "rb");
+    if (df != nullptr) {
         fseek(df, 0, SEEK_END);
-        long sz = ftell(df);
+        const long sz = ftell(df);
         fseek(df, 0, SEEK_SET);
-        if (sz > 0) {
-            file_buf.resize(sz);
-            if (fread(file_buf.data(), 1, sz, df) == static_cast<size_t>(sz)) {
-                dex_bytes = file_buf.data();
-                dex_size = static_cast<size_t>(sz);
-                LOGI("Loaded dynamic DEX from %s (%zu bytes)", dynamic_dex_path, dex_size);
+        if (sz > 0 && sz <= 8 * 1024 * 1024) {
+            g_dex_keepalive.resize(static_cast<size_t>(sz));
+            if (fread(g_dex_keepalive.data(), 1, static_cast<size_t>(sz), df)
+                    == static_cast<size_t>(sz)) {
+                dynamic = true;
+            } else {
+                g_dex_keepalive.clear();
             }
         }
         fclose(df);
     }
-
-    if (dex_bytes == battmon_dex) {
-        LOGI("Loading embedded fallback DEX (%zu bytes)...", dex_size);
+    if (!dynamic) {
+        g_dex_keepalive.assign(battmon_dex, battmon_dex + battmon_dex_len);
+        LOGI("Using embedded DEX (%zu bytes)", static_cast<size_t>(battmon_dex_len));
+    } else {
+        LOGI("Using dynamic DEX from %s (%zu bytes)", kDynamicDexPath, g_dex_keepalive.size());
     }
 
-    jclass appClass = env->GetObjectClass(appObj);
-    jmethodID getClMethod = env->GetMethodID(appClass, "getClassLoader", "()Ljava/lang/ClassLoader;");
-    jobject appCl = env->CallObjectMethod(appObj, getClMethod);
-    if (!appCl) {
-        LOGE("Failed to get ClassLoader from Application");
+    jclass app_class = env->GetObjectClass(app);
+    jmethodID get_class_loader = env->GetMethodID(app_class, "getClassLoader",
+                                                 "()Ljava/lang/ClassLoader;");
+    jobject app_loader = get_class_loader != nullptr
+            ? env->CallObjectMethod(app, get_class_loader) : nullptr;
+    if (app_loader == nullptr) {
+        LOGE("Failed to get the ClassLoader of the Application");
         vm->DetachCurrentThread();
         return nullptr;
     }
 
-    jobject byteBuffer = env->NewDirectByteBuffer(const_cast<unsigned char*>(dex_bytes), static_cast<jlong>(dex_size));
-    if (!byteBuffer) {
-        LOGE("Failed to create DirectByteBuffer for DEX");
+    jobject byte_buffer = env->NewDirectByteBuffer(g_dex_keepalive.data(),
+                                                   static_cast<jlong>(g_dex_keepalive.size()));
+    if (byte_buffer == nullptr) {
+        LOGE("Failed to create the DirectByteBuffer for the DEX");
         vm->DetachCurrentThread();
         return nullptr;
     }
 
-    jclass dexLoaderClass = env->FindClass("dalvik/system/InMemoryDexClassLoader");
-    if (!dexLoaderClass) {
-        LOGE("dalvik.system.InMemoryDexClassLoader class not found");
+    jclass loader_class = env->FindClass("dalvik/system/InMemoryDexClassLoader");
+    if (loader_class == nullptr) {
+        LOGE("dalvik.system.InMemoryDexClassLoader not found");
+        env->ExceptionClear();
         vm->DetachCurrentThread();
         return nullptr;
     }
 
-    jmethodID dexLoaderCtor = env->GetMethodID(dexLoaderClass, "<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
-    jobject dexLoader = env->NewObject(dexLoaderClass, dexLoaderCtor, byteBuffer, appCl);
-    if (env->ExceptionCheck()) {
-        LOGE("Exception instantiating InMemoryDexClassLoader");
+    jmethodID loader_ctor = env->GetMethodID(loader_class, "<init>",
+                                             "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
+    jobject dex_loader = env->NewObject(loader_class, loader_ctor, byte_buffer, app_loader);
+    if (env->ExceptionCheck() || dex_loader == nullptr) {
+        LOGE("Failed to instantiate InMemoryDexClassLoader");
         env->ExceptionDescribe();
         env->ExceptionClear();
         vm->DetachCurrentThread();
         return nullptr;
     }
 
-    jclass clClass = env->FindClass("java/lang/ClassLoader");
-    jmethodID loadClassMethod = env->GetMethodID(clClass, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
-    jstring className = env->NewStringUTF("com.battmon.BattMon");
-    jclass battMonClass = reinterpret_cast<jclass>(env->CallObjectMethod(dexLoader, loadClassMethod, className));
-    env->DeleteLocalRef(className);
+    jclass class_loader_class = env->FindClass("java/lang/ClassLoader");
+    jmethodID load_class = env->GetMethodID(class_loader_class, "loadClass",
+                                            "(Ljava/lang/String;)Ljava/lang/Class;");
+    jstring class_name = env->NewStringUTF(kEntryClass);
+    jclass entry_class = reinterpret_cast<jclass>(
+            env->CallObjectMethod(dex_loader, load_class, class_name));
+    env->DeleteLocalRef(class_name);
 
-    if (env->ExceptionCheck() || !battMonClass) {
-        LOGE("Failed to load com.battmon.BattMon via InMemoryDexClassLoader");
+    if (env->ExceptionCheck() || entry_class == nullptr) {
+        LOGE("Failed to load %s", kEntryClass);
         env->ExceptionDescribe();
         env->ExceptionClear();
         vm->DetachCurrentThread();
         return nullptr;
     }
 
-    jmethodID initMethod = env->GetStaticMethodID(battMonClass, "init", "(Landroid/content/Context;)V");
-    if (!initMethod) {
-        LOGE("com.battmon.BattMon.init(Context) method not found");
+    jmethodID init_method = env->GetStaticMethodID(entry_class, "init",
+                                                   "(Landroid/content/Context;)V");
+    if (init_method == nullptr) {
+        LOGE("%s.init(Context) not found", kEntryClass);
+        env->ExceptionClear();
         vm->DetachCurrentThread();
         return nullptr;
     }
 
-    env->CallStaticVoidMethod(battMonClass, initMethod, appObj);
+    env->CallStaticVoidMethod(entry_class, init_method, app);
     if (env->ExceptionCheck()) {
-        LOGE("Exception executing BattMon.init(Context)");
+        LOGE("Exception while executing %s.init(Context)", kEntryClass);
         env->ExceptionDescribe();
         env->ExceptionClear();
     } else {
-        LOGI("BattMon.init executed successfully inside SystemUI");
+        LOGI("%s.init executed successfully", kEntryClass);
     }
 
     vm->DetachCurrentThread();
     return nullptr;
 }
+
+}  // namespace
 
 class BattMonModule : public zygisk::ModuleBase {
 public:
@@ -167,33 +205,57 @@ public:
     }
 
     void postAppSpecialize(const AppSpecializeArgs *args) override {
-        const char* nice_name = env->GetStringUTFChars(args->nice_name, nullptr);
-        if (!nice_name || strcmp(nice_name, "com.android.systemui") != 0) {
-            if (nice_name) env->ReleaseStringUTFChars(args->nice_name, nice_name);
+        if (args == nullptr || args->nice_name == nullptr) {
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+        const char *nice_name = env->GetStringUTFChars(args->nice_name, nullptr);
+        const bool is_target = nice_name != nullptr && strcmp(nice_name, kTargetPackage) == 0;
+        if (nice_name != nullptr) {
+            env->ReleaseStringUTFChars(args->nice_name, nice_name);
+        }
+        if (!is_target) {
+            // Nothing to do in any other process: unmap the module immediately so it
+            // cannot cost memory (or exist at all) anywhere else.
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
-        LOGI("postAppSpecialize matched target package: %s", nice_name);
-        env->ReleaseStringUTFChars(args->nice_name, nice_name);
+        LOGI("postAppSpecialize matched %s", kTargetPackage);
 
-        JavaVM* vm = nullptr;
-        if (env->GetJavaVM(&vm) != JNI_OK || !vm) {
-            LOGE("Failed to get JavaVM pointer");
+        if (g_worker_started.exchange(true)) {
+            return;   // never start a second initialization thread
+        }
+
+        JavaVM *vm = nullptr;
+        if (env->GetJavaVM(&vm) != JNI_OK || vm == nullptr) {
+            LOGE("Failed to get the JavaVM pointer");
+            g_worker_started.store(false);
             return;
         }
 
         pthread_t tid;
-        if (pthread_create(&tid, nullptr, InitWorker, reinterpret_cast<void*>(vm)) == 0) {
+        if (pthread_create(&tid, nullptr, InitWorker, reinterpret_cast<void *>(vm)) == 0) {
             pthread_detach(tid);
         } else {
-            LOGE("Failed to launch background InitWorker thread");
+            LOGE("Failed to launch the initialization worker thread");
+            g_worker_started.store(false);
         }
     }
 
+    /**
+     * system_server is forked from zygote like any other process, so Zygisk calls
+     * preServerSpecialize()/postServerSpecialize() for it. This module has nothing to do
+     * there; without this override the base-class no-op left the module library mapped
+     * inside system_server for the whole uptime of the device.
+     */
+    void postServerSpecialize(const ServerSpecializeArgs *) override {
+        api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+    }
+
 private:
-    Api *api;
-    JNIEnv *env;
+    Api *api = nullptr;
+    JNIEnv *env = nullptr;
 };
 
 REGISTER_ZYGISK_MODULE(BattMonModule)
